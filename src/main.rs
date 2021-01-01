@@ -11,7 +11,7 @@ pub struct CatFile {
 }
 
 #[derive(Debug, StructOpt)]
-#[structopt(about = "the stupid content tracker")]
+#[structopt(about = "our stupid content tracker")]
 enum Git {
     // #[structopt(flatten)]
     CatFile(CatFile),
@@ -29,6 +29,6 @@ fn main() {
     };
     match result {
         Ok(obj) => println!("{:?}", obj),
-        Err(e) => panic!("{}", e),
+        Err(e) => panic!("{:?}", e),
     }
 }
