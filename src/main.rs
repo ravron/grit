@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate anyhow;
 
+pub(crate) mod buf_utils;
 mod cat_file;
 
 use structopt::StructOpt;

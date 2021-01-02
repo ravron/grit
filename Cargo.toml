@@ -10,3 +10,7 @@ edition = "2018"
 structopt = "0.3"
 anyhow = "1.0"
 compress = "0.2"
+hex = "0.4"
+
+[dev-dependencies]
+indoc = "1.0"
