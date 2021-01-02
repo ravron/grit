@@ -6,41 +6,45 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::{env, fmt};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use compress::zlib;
+use hex::FromHex;
+
+use crate::buf_utils::BufUtils;
 
 use super::CatFile;
 
-// #[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Object {
     Blob(Vec<u8>),
-    // Tree,
+    Tree(Vec<TreeEntry>),
     // Commit,
 }
 
-impl Debug for Object {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Object::Blob(b) => {
-                let mut slice_len = b.len();
-                let mut truncated = false;
-                if slice_len > 30 {
-                    slice_len = 30;
-                    truncated = true;
-                }
-
-                let mut dt = f.debug_tuple("Blob");
-
-                if let Ok(s) = String::from_utf8(b[..slice_len].to_vec()) {
-                    dt.field(&s);
-                } else {
-                    dt.field(&&(b[..slice_len]));
-                }
-                dt.finish()
-            }
-        }
-    }
-}
+// TODO - Implement for tree and uncomment
+// impl Debug for Object {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+//         match self {
+//             Object::Blob(b) => {
+//                 let mut slice_len = b.len();
+//                 let mut truncated = false;
+//                 if slice_len > 30 {
+//                     slice_len = 30;
+//                     truncated = true;
+//                 }
+//
+//                 let mut dt = f.debug_tuple("Blob");
+//
+//                 if let Ok(s) = String::from_utf8(b[..slice_len].to_vec()) {
+//                     dt.field(&s);
+//                 } else {
+//                     dt.field(&&(b[..slice_len]));
+//                 }
+//                 dt.finish()
+//             }
+//         }
+//     }
+// }
 
 pub fn cat_file(opts: &CatFile) -> Result<Object> {
     println!("{}", opts.object_name);
@@ -71,92 +75,75 @@ fn read_object(path: &Path) -> Result<Object> {
     // Snarf it all into buf
     let mut buf = vec![];
     zlib::Decoder::new(stream).read_to_end(&mut buf)?;
+    let mut buf = buf.as_slice();
 
-    // Iterator for header, then body
-    let mut header_then_body = buf.splitn(2, |b| *b == b'\0');
-    let header = header_then_body
-        .next()
-        .ok_or(anyhow!("cannot locate header"))?;
+    let object_type = buf.get_str_until(b' ')?;
+    let _object_size = buf.get_str_until(b'\0')?.parse::<u64>()?;
 
-    // Get type and len from header
-    let header = str::from_utf8(&header)?;
-    let mut header_split = header.split(' ');
-    let type_str = header_split
-        .next()
-        .ok_or(anyhow!("invalid header {:?}", header))?;
-    let _len = header_split
-        .next()
-        .ok_or(anyhow!("invalid header {:?}", header))?
-        .parse::<u64>()?;
-
-    let body = header_then_body
-        .next()
-        .ok_or(anyhow!("no body present in object"))?;
-
-    match type_str {
+    match object_type {
         // TODO: figure out how I can go from a slice of buf to an owned Vec<u8>
         // without the cloning that occurs in to_vec (and to_owned).
-        "blob" => Ok(Object::Blob(body.to_vec())),
+        "blob" => Ok(Object::Blob(buf.to_vec())),
         "tree" => {
-            println!("{:?}", body);
-            parse_tree(body)?;
-            Ok(Object::Blob(body.to_vec()))
+            println!("{:?}", buf);
+            Ok(Object::Tree(parse_tree(buf)?))
         }
-        _ => Err(anyhow!("unexpected object type {}", header)),
+        _ => Err(anyhow!("unexpected object type {}", object_type)),
     }
 }
 
-#[derive(Debug)]
-struct Sha([u8; 20]);
+#[derive(Debug, Eq, PartialEq)]
+pub struct Sha([u8; 20]);
 
-#[derive(Debug)]
-struct TreeEntry {
+impl Sha {
+    fn from_hex(hex_str: impl AsRef<[u8]>) -> Result<Self> {
+        Ok(Sha(<[u8; 20]>::from_hex(hex_str)?))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TreeEntryType {
+    Blob,
+    Tree,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct TreeEntry {
     permissions: u32,
     entry_type: TreeEntryType,
     sha: Sha,
     filename: String,
 }
 
-#[derive(Debug)]
-enum TreeEntryType {
-    Blob,
-    Tree,
+fn parse_tree_entry(b: &mut &[u8]) -> Result<TreeEntry> {
+    let permissions = b.get_str_until(b' ')?;
+    let permissions = u32::from_str_radix(permissions, 8)?;
+
+    let filename = b.get_str_until(b'\0')?.to_owned();
+
+    // Would be cool to remove the try_into using const generics once that's a thing.
+    let sha_bytes = b.get_n_exact(20)?;
+    let sha = Sha(sha_bytes.try_into()?);
+
+    let entry_type = if permissions == 0o40000 {
+        TreeEntryType::Tree
+    } else {
+        TreeEntryType::Blob
+    };
+
+    Ok(TreeEntry {
+        permissions,
+        entry_type,
+        sha,
+        filename,
+    })
 }
 
 fn parse_tree(mut b: &[u8]) -> Result<Vec<TreeEntry>> {
     let mut result = Vec::new();
 
     while b.len() > 0 {
-        let space_idx = b
-            .iter()
-            .position(|b| *b == b' ')
-            .ok_or(anyhow!("invalid tree object"))?;
-        let permissions = str::from_utf8(&b[..space_idx])?;
-        let permissions = u32::from_str_radix(permissions, 8)?;
-        b = &b[space_idx + 1..];
-
-        let null_idx = b
-            .iter()
-            .position(|b| *b == b'\0')
-            .ok_or(anyhow!("invalid tree object"))?;
-        let filename = str::from_utf8(&b[..null_idx])?.to_owned();
-        b = &b[null_idx + 1..];
-
-        let sha = Sha(b[..20].try_into()?);
-        b = &b[20..];
-
-        let entry_type = if permissions == 0o40000 {
-            TreeEntryType::Tree
-        } else {
-            TreeEntryType::Blob
-        };
-
-        result.push(TreeEntry {
-            permissions,
-            entry_type,
-            sha,
-            filename,
-        })
+        result.push(parse_tree_entry(&mut b).with_context(|| "invalid tree object")?);
     }
 
     Ok(result)
@@ -176,4 +163,70 @@ fn nearest_git_dir() -> Result<PathBuf> {
         current = current_path.parent().map(|cp| cp.to_owned());
     }
     bail!("could not find parent .git dir")
+}
+
+/// NOTE: As is, these rely on being run in this repo with some initial commits as loose objects
+/// (not packed objects).
+#[cfg(test)]
+mod test {
+    use anyhow::Result;
+    use indoc::indoc;
+
+    use crate::cat_file::{cat_file, Object, Sha, TreeEntry, TreeEntryType};
+    use crate::CatFile;
+
+    #[test]
+    fn blob() -> Result<()> {
+        assert_eq!(
+            cat_file(&CatFile { object_name: "22d351634acf3113b730bffd3638e14f62ef2af3".to_owned() })?,
+            Object::Blob(indoc! {"
+                # Generated by Cargo
+                # will have compiled files and executables
+                /target/
+
+                # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
+                # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
+                Cargo.lock
+
+                # These are backup files generated by rustfmt
+                **/*.rs.bk
+
+
+                # Added by cargo
+
+                /target
+            " }.as_bytes().to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree() -> Result<()> {
+        assert_eq!(
+            cat_file(&CatFile {
+                object_name: "286597eb289fb690c2ec453b63b683b4cb1ce9ba".to_owned()
+            })?,
+            Object::Tree(vec![
+                TreeEntry {
+                    permissions: 0o100644,
+                    entry_type: TreeEntryType::Blob,
+                    sha: Sha::from_hex("22d351634acf3113b730bffd3638e14f62ef2af3")?,
+                    filename: ".gitignore".to_owned(),
+                },
+                TreeEntry {
+                    permissions: 0o100644,
+                    entry_type: TreeEntryType::Blob,
+                    sha: Sha::from_hex("123edcd7ebb3ea8086ee41077b22acc81c8db742")?,
+                    filename: "Cargo.toml".to_owned(),
+                },
+                TreeEntry {
+                    permissions: 0o040000,
+                    entry_type: TreeEntryType::Tree,
+                    sha: Sha::from_hex("305157a396c6858705a9cb625bab219053264ee4")?,
+                    filename: "src".to_owned(),
+                },
+            ]),
+        );
+        Ok(())
+    }
 }
